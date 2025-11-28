@@ -1,0 +1,4 @@
+# Ignorer le dossier des téléchargements
+BRVM_Convocations/
+__pycache__/
+.DS_Store
