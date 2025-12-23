@@ -1,148 +1,90 @@
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-import os
+from selenium import webdriver
+from selenium.webdriver.edge.service import Service
+from webdriver_manager.microsoft import EdgeChromiumDriverManager
+import pandas as pd
 import time
-import re
-import warnings
-
-# Ignorer les avertissements SSL
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-warnings.simplefilter('ignore', InsecureRequestWarning)
+from datetime import datetime
+import os
+import io
 
 # --- CONFIGURATION ---
-# C'est l'URL spécifique que tu m'as donnée
-START_URL = "https://www.brvm.org/fr/emetteurs/type-annonces/convocations-assemblees-generales"
-BASE_FOLDER = "BRVM_Convocations"  # Dossier où tout sera sauvegardé
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-}
+URL = "https://www.brvm.org/fr/cours/actions"
+FICHIER_SORTIE = "cours_brvm_edge.csv"
+INTERVALLE = 60
 
-def clean_filename(name):
-    """Nettoie un nom pour qu'il soit valide comme nom de fichier/dossier."""
-    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
+def clean_money_column(col):
+    """Nettoie les colonnes de prix"""
+    if col.dtype == 'object':
+        col = col.str.replace(r'[^\d,-]', '', regex=True)
+        col = col.str.replace(',', '.')
+        col = pd.to_numeric(col, errors='coerce').fillna(0.0)
+    return col
 
-def download_file(session, url, folder, filename_prefix=""):
-    """Télécharge un fichier PDF."""
+def capture_cours_edge():
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"\n⚡ [{now}] Lancement de Microsoft Edge...")
+
     try:
-        # Nettoyage du nom du fichier distant
-        parsed = urlparse(url)
-        filename = os.path.basename(parsed.path)
-        if not filename.lower().endswith('.pdf'):
-            filename += ".pdf"
+        # Configuration spécifique pour Edge
+        options = webdriver.EdgeOptions()
+        # options.add_argument("--headless") # Enlève le # pour cacher la fenêtre
         
-        # On ajoute un préfixe (ex: nom de l'entreprise) si fourni
-        if filename_prefix:
-            # On coupe si c'est trop long pour éviter les erreurs Windows
-            prefix_clean = clean_filename(filename_prefix)[:50] 
-            full_filename = f"{prefix_clean}_{filename}"
-        else:
-            full_filename = filename
-            
-        save_path = os.path.join(folder, full_filename)
-
-        if os.path.exists(save_path):
-            print(f"  [Info] Déjà présent : {full_filename}")
+        # On installe et lance le pilote Edge
+        driver = webdriver.Edge(service=Service(EdgeChromiumDriverManager().install()), options=options)
+        
+        driver.get(URL)
+        
+        print("   ⏳ Attente de 10 secondes (Chargement tableau)...")
+        time.sleep(10) 
+        
+        # On prend le HTML une fois chargé
+        html_complet = driver.page_source
+        
+        # Pandas lit le HTML
+        dfs = pd.read_html(io.StringIO(html_complet))
+        print(f"   🔎 Pandas a trouvé {len(dfs)} tableaux.")
+        
+        target_df = None
+        for df in dfs:
+            # Recherche des colonnes clés
+            cols = [str(c).strip() for c in df.columns]
+            if "Symbole" in cols and "Volume" in cols:
+                target_df = df
+                break
+        
+        if target_df is None:
+            print("   ❌ Tableau non trouvé.")
+            driver.quit()
             return
 
-        print(f"  [Téléchargement] {full_filename}...")
-        response = session.get(url, verify=False, timeout=20)
+        print("   ✅ Tableau identifié ! Extraction...")
+
+        # Ajout date et nettoyage
+        target_df['Date_Releve'] = now
+        for col in target_df.columns:
+            c_str = str(col)
+            if any(x in c_str for x in ["Clôture", "Volume", "Variation", "Veille"]):
+                target_df[col] = clean_money_column(target_df[col])
+
+        # Sauvegarde
+        header = not os.path.exists(FICHIER_SORTIE)
+        target_df.to_csv(FICHIER_SORTIE, mode='a', header=header, index=False, sep=';', encoding='utf-8-sig')
         
-        if response.status_code == 200:
-            with open(save_path, 'wb') as f:
-                f.write(response.content)
-            print(f"  [Succès] Sauvegardé.")
-        else:
-            print(f"  [Erreur] Statut {response.status_code}")
-            
+        print(f"   💾 {len(target_df)} lignes sauvegardées dans {FICHIER_SORTIE}.")
+        
+        # Fermeture
+        driver.quit()
+
     except Exception as e:
-        print(f"  [Echec] Erreur : {e}")
-
-def scrape_convocations():
-    # Création du dossier principal
-    if not os.path.exists(BASE_FOLDER):
-        os.makedirs(BASE_FOLDER)
-        print(f"Dossier créé : {os.path.abspath(BASE_FOLDER)}")
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    
-    current_page = 0
-    
-    while True:
-        # Gestion de la pagination (page=0, page=1...)
-        url = f"{START_URL}?page={current_page}"
-        print(f"\n>>> Analyse de la page {current_page} : {url}")
-        
+        print(f"   ❌ Erreur : {e}")
         try:
-            response = session.get(url, verify=False, timeout=15)
-            if response.status_code != 200:
-                print("Fin des pages ou erreur d'accès.")
-                break
-                
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Recherche de tous les liens PDF sur la page
-            # Sur ce site, les liens de téléchargement contiennent souvent "file" ou finissent par .pdf
-            # On cherche aussi les balises qui contiennent le texte "Télécharger"
-            
-            links_found = 0
-            
-            # Stratégie : On cherche les blocs d'annonces (souvent dans des 'views-row')
-            rows = soup.find_all('div', class_='views-row')
-            
-            if not rows:
-                print("Aucune annonce trouvée sur cette page (structure différente ?).")
-                # Tentative de secours : chercher tous les liens PDF bruts
-                raw_pdf_links = soup.select('a[href$=".pdf"]')
-                for link in raw_pdf_links:
-                    pdf_url = urljoin(START_URL, link['href'])
-                    download_file(session, pdf_url, BASE_FOLDER)
-                    links_found += 1
-            else:
-                for row in rows:
-                    # Essai de trouver le titre ou l'entreprise dans la ligne
-                    text_content = row.get_text(separator=" ", strip=True)
-                    
-                    # On cherche le lien PDF à l'intérieur de cette ligne
-                    pdf_link = row.find('a', href=True)
-                    
-                    # Parfois il y a plusieurs liens, on cherche celui qui mène à un fichier
-                    # ou qui contient 'Télécharger'
-                    valid_link = None
-                    for a in row.find_all('a', href=True):
-                        if '.pdf' in a['href'].lower() or 'upload' in a['href'].lower():
-                            valid_link = a['href']
-                            break
-                    
-                    if valid_link:
-                        pdf_url = urljoin(START_URL, valid_link)
-                        # On utilise le début du texte comme "Nom d'entreprise" présumé
-                        # Ex: "BOA SENEGAL : Avis de convocation..." -> on garde "BOA SENEGAL"
-                        company_guess = text_content.split(':')[0] if ':' in text_content else "Document"
-                        
-                        download_file(session, pdf_url, BASE_FOLDER, filename_prefix=company_guess)
-                        links_found += 1
+            driver.quit()
+        except:
+            pass
 
-            print(f"   -> {links_found} documents traités sur cette page.")
-            
-            # Si on ne trouve rien sur la page 0 ou 1, c'est suspect, mais on continue un peu
-            if links_found == 0 and current_page > 2:
-                print("Aucun document trouvé sur plusieurs pages consécutives. Arrêt.")
-                break
-
-            # Vérification s'il y a une page suivante (bouton 'suivant' ou 'next')
-            next_button = soup.find('a', title='Aller à la page suivante')
-            if not next_button and links_found == 0:
-                 # Si pas de bouton suivant et pas de liens, c'est fini
-                 break
-            
-            current_page += 1
-            time.sleep(1) # Pause politesse
-            
-        except Exception as e:
-            print(f"Erreur critique : {e}")
-            break
-
-if __name__ == "__main__":
-    scrape_convocations()
+# BOUCLE
+print("🚀 Démarrage Moniteur (Version Edge)...")
+while True:
+    capture_cours_edge()
+    print(f"   💤 Pause de {INTERVALLE}s...")
+    time.sleep(INTERVALLE)
